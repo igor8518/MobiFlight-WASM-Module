@@ -38,7 +38,7 @@ constexpr uint16_t CLIENT_DATA_DEF_ID_STRINGVAR_RANGE = 10000;
 
 // Maximum number of variables that are read from sim per frame, Default: 30
 // Can be set to different value via config command
-uint16_t MOBIFLIGHT_MAX_VARS_PER_FRAME = 30;
+uint16_t MOBIFLIGHT_MAX_VARS_PER_FRAME = 10;
 
 // Max length of a string variable. This will affect the maximum amount of string variables
 // due to the maximum client-data-array-size (SIMCONNECT_CLIENTDATA_MAX_SIZE) of 8kB!
@@ -47,9 +47,11 @@ constexpr uint16_t MOBIFLIGHT_STRING_SIMVAR_VALUE_MAX_LEN = 128;
 // data struct for dynamically registered SimVars
 struct SimVar {
 	int ID;
+	int SimID = -1;
 	int Offset;
 	std::string Name;
 	float Value;
+	int Priority;
 };
 
 struct StringSimVar {
@@ -211,6 +213,20 @@ void SendResponse(const char * message, Client* client) {
 	);
 }
 
+void SendResponseVarSet(std::string prefix, int id, Client* client) {
+		std::string str = prefix + std::string(".") + std::to_string(id);
+		const char* str2 = str.c_str();
+		SimConnect_SetClientData(
+			g_hSimConnect,
+			client->DataAreaIDResponse,
+			client->DataDefinitionIDStringResponse,
+			SIMCONNECT_CLIENT_DATA_SET_FLAG_DEFAULT,
+			0,
+			MOBIFLIGHT_MESSAGE_SIZE,
+			(void*)str2
+		);
+}
+
 // Sends information that new client data areas are created.
 void SendNewClientResponse(Client* client, Client* nc) {
 	std::ostringstream oss;
@@ -285,16 +301,18 @@ void WriteSimVar(SimVar& simVar, Client* client) {
 }
 
 // Register a single Float-SimVar and send the current value to SimConnect Clients
-void RegisterFloatSimVar(const std::string code, Client* client) {
+void RegisterFloatSimVar(const std::string code, Client* client, int priority) {
 	std::vector<SimVar>* SimVars = &(client->SimVars);
 	std::vector<StringSimVar>* StringSimVars = &(client->StringSimVars);
 	SimVar newSimVar;
 	HRESULT hr;
-
+	
+	
 	newSimVar.Name = code;
-	newSimVar.ID = SimVars->size() + client->DataDefinitionIdSimVarsStart;
-	newSimVar.Offset = SimVars->size() * (sizeof(float));
 	newSimVar.Value = 0.0F;
+	newSimVar.Priority = priority;
+	newSimVar.Offset = SimVars->size() * (sizeof(float));
+	newSimVar.ID = SimVars->size() + client->DataDefinitionIdSimVarsStart;
 	SimVars->push_back(newSimVar);
 
 	if (client->MaxClientDataDefinition < (SimVars->size() + StringSimVars->size())) {
@@ -439,17 +457,33 @@ void ReadSimVars() {
 
 		int totalSimVars = SimVars->size() + StringSimVars->size();
 		int maxVarsPerFrame = (totalSimVars < MOBIFLIGHT_MAX_VARS_PER_FRAME) ? totalSimVars : MOBIFLIGHT_MAX_VARS_PER_FRAME;
+		for (int i = 0; i < SimVars->size(); i++) {
+			if (SimVars->at(i).Priority == 0) {
+				if (i < totalSimVars) {
+					ReadSimVar(SimVars->at(i), client);
+				}
+				else {
+					ReadSimVar(StringSimVars->at(i - SimVars->size()), client);
+				}
+			}
+		}
 
 		for (int i=0; i < maxVarsPerFrame; ++i) {
-			if(client->RollingClientDataReadIndex < SimVars->size() ) {
-				ReadSimVar(SimVars->at(client->RollingClientDataReadIndex), client);
+			if (SimVars->at(i).Priority == 1) {
+				if (client->RollingClientDataReadIndex < SimVars->size()) {
+					ReadSimVar(SimVars->at(client->RollingClientDataReadIndex), client);
+				}
+				else {
+					ReadSimVar(StringSimVars->at(client->RollingClientDataReadIndex - SimVars->size()), client);
+				}
+				client->RollingClientDataReadIndex++;
+				if (client->RollingClientDataReadIndex >= totalSimVars)
+					client->RollingClientDataReadIndex = 0;
 			}
 			else {
-				ReadSimVar(StringSimVars->at(client->RollingClientDataReadIndex - SimVars->size()), client);
+				maxVarsPerFrame++;
+				maxVarsPerFrame = (totalSimVars < MOBIFLIGHT_MAX_VARS_PER_FRAME) ? totalSimVars : MOBIFLIGHT_MAX_VARS_PER_FRAME;
 			}
-			client->RollingClientDataReadIndex++;
-			if (client->RollingClientDataReadIndex >= totalSimVars)
-				client->RollingClientDataReadIndex = 0;
 		}
 	}
 }
@@ -673,9 +707,77 @@ void CALLBACK MyDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* pContex
 				break;
 
 			}
-			// MF.SimVars.Set(5 (>L:MyVar))
+			// MF.SimVars.Set.(5.000 (>L:MyVar))
 			else if (str.find("MF.SimVars.Set.") != std::string::npos) {
+				std::vector<SimVar>* SimVars = &(client->SimVars);
+				std::vector<StringSimVar>* StringSimVars = &(client->StringSimVars);
+
+				int IDVar = -2;
+				int SimIDVar = -1;
 				std::string prefix = "MF.SimVars.Set.";
+				std::string varName = "";
+				std::string varVal = "";
+				double val = 0.0;
+				str = str.substr(prefix.length());
+				int varNamePos1 = str.find(">");
+				int varNamePos2 = str.find(")", varNamePos1);
+				bool error = false;
+				if (varNamePos1 != std::string::npos && varNamePos2 != std::string::npos) {
+					int len = varNamePos2 - varNamePos1 - 1;
+					varName = str.substr(varNamePos1 + 1, len);
+				}
+
+				std::vector<SimVar>::iterator var = std::find_if(SimVars->begin(), SimVars->end(), [&](SimVar& sv) { return sv.Name.find(varName) != std::string::npos; });
+				if (var != SimVars->end()) {
+					if (var->SimID == -1) {
+						var->SimID = check_named_variable(varName.c_str());
+						if (var->SimID == -1) {
+							var->SimID = register_named_variable(varName.c_str());
+						}
+					}
+					IDVar = var->ID;
+					SimIDVar = var->SimID;
+				}
+				else {
+					IDVar = -2;
+					SimIDVar = -1;
+					error = true;
+				}
+
+				int varValPos1 = str.find("(");
+				int varValPos2 = str.find(" ", varValPos1);
+				if (varValPos2 == std::string::npos) {
+					varValPos2 = str.find("(", varValPos1);
+				}
+				if (varValPos1 != std::string::npos && varValPos2 != std::string::npos) {
+					int len = varValPos2 - varValPos1 - 1;
+					varVal = str.substr(varValPos1 + 1, len);
+					val = std::stod(varVal);
+						/* TO DO try catch need
+						val = 0.0;
+						error = true;*/
+				}
+#if _DEBUG
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: Set value Code: " << str.c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varNamePos1: " << std::to_string(varNamePos1).c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varNamePos2: " << std::to_string(varNamePos2).c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varName: " << varName.c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varValPos1: " << std::to_string(varValPos1).c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varValPos2: " << std::to_string(varValPos2).c_str() << std::endl;
+				std::cout << "MobiFlight[" << client->Name.c_str() << "]: varNVal: " << varVal.c_str() << std::endl;
+#endif
+				if (!error) {
+					set_named_variable_value(SimIDVar, val);
+				}
+				else {
+					std::cout << "MobiFlight[" << client->Name.c_str() << "]: Variable " << varVal.c_str() << "not found";
+				}
+				SendResponseVarSet(prefix, IDVar, client);
+				break;
+			}
+			// MF.SimVars.Execute.(5 (>L:MyVar))
+			else if (str.find("MF.SimVars.Execute.") != std::string::npos) {
+				std::string prefix = "MF.SimVars.Execute.";
 				str = str.substr(prefix.length());
 #if _DEBUG
 				std::cout << "MobiFlight[" << client->Name.c_str() << "]: Executing Code: " << str.c_str() << std::endl;
@@ -688,8 +790,10 @@ void CALLBACK MyDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* pContex
 
 			if (m_str.get()->find("MF.SimVars.Add.") != std::string::npos) {
 				std::string prefix = "MF.SimVars.Add.";
-				str = m_str.get()->substr(prefix.length());
-				RegisterFloatSimVar(str, client);
+				std::string priorityStr = m_str.get()->substr(prefix.length(), 1);
+				int priority = std::atoi(priorityStr.c_str());
+				str = m_str.get()->substr(prefix.length() + 2);
+				RegisterFloatSimVar(str, client, priority);
 				std::cout << "MobiFlight[" << client->Name.c_str() << "]: Received SimVar to register: " << str.c_str() << std::endl;
 				break;
 			}
